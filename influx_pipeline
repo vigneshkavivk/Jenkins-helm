@@ -4,7 +4,7 @@ pipeline {
     environment {
         VENV_PATH = 'venv-checkov'
         CHECKOV_OUTPUT = 'checkov_output.txt'
-        REPO_URL = 'https://github.com/Venkatvicky/vault-secret.git'
+        REPO_URL = 'https://github.com/Abinesh0206/post-git.git'
         REPO_BRANCH = 'main'
         INFLUX_TOKEN = credentials('INFLUX-CRED')   // Stored in Jenkins credentials
         INFLUX_ORG = 'CloudMasa'
@@ -37,11 +37,15 @@ pipeline {
         stage('Render Helm Charts') {
             steps {
                 sh '''
+                    echo "🧹 Cleaning previous rendered files..."
+                    rm -rf rendered/
+                    mkdir -p rendered
+                    
                     echo " Rendering Helm charts into split files..."
                     mkdir -p rendered
                     find . -name "Chart.yaml" | while read chart_file; do
                         chart_dir=$(dirname "$chart_file")
-                        chart_name=$(basename "$chart_dir")
+                        chart_name=$(basename "$chart_dir" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-')
                         mkdir -p rendered/${chart_name}
                         helm template ${chart_name} ${chart_dir} --output-dir rendered/${chart_name}
                     done
