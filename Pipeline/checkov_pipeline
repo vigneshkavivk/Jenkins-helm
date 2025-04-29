@@ -1,0 +1,81 @@
+pipeline {
+    agent any
+
+    environment {
+        VENV_PATH = 'venv-checkov'
+        CHECKOV_OUTPUT = 'checkov_output.txt'
+        REPO_URL = 'https://github.com/Thiru152003/ghost-blog.git'
+        REPO_BRANCH = 'main'
+    }
+
+    stages {
+        stage('Clone Helm Repo') {
+            steps {
+                git branch: "${REPO_BRANCH}",
+                    url: "${REPO_URL}"
+            }
+        }
+
+        stage('Set Up Virtual Environment and Install Checkov') {
+            steps {
+                sh '''
+                    apt install python3.11-venv -y
+                    python3 -m venv ${VENV_PATH}
+                    . ${VENV_PATH}/bin/activate
+                    ${VENV_PATH}/bin/pip install --upgrade pip
+                    ${VENV_PATH}/bin/pip install checkov
+                    curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+                '''
+            }
+        }
+
+        stage('Render Helm Charts') {
+            steps {
+                sh '''
+                    echo "🧹 Cleaning previous rendered files..."
+                    rm -rf rendered/
+                    mkdir -p rendered
+                    
+                    echo "🔧 Rendering Helm charts into split files..."
+                    find . -name "Chart.yaml" | while read chart_file; do
+                        chart_dir=$(dirname "$chart_file")
+                        chart_name=$(basename "$chart_dir" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-')
+                        mkdir -p rendered/${chart_name}
+                        helm template ${chart_name} ${chart_dir} --output-dir rendered/${chart_name}
+                    done
+                '''
+            }
+        }
+
+        stage('Run Checkov on Rendered YAMLs') {
+            steps {
+                script {
+                    def checkovExitCode = sh(
+                        script: '''
+                            . ${VENV_PATH}/bin/activate
+                            echo "👉 Running Checkov on rendered templates..." > ${CHECKOV_OUTPUT}
+                            ${VENV_PATH}/bin/checkov -d rendered/ --framework kubernetes --quiet \
+                                --skip-check CKV_K8S_43,CKV_K8S_20,CKV_K8S_30,CKV_K8S_28,CKV_K8S_22,CKV_K8S_40,CKV_K8S_31,CKV_K8S_35 \
+                                | tee -a ${CHECKOV_OUTPUT}
+                        ''',
+                        returnStatus: true
+                    )
+
+                    sh "cat ${CHECKOV_OUTPUT}"
+
+                    if (checkovExitCode != 0) {
+                        error "❌Checkov found policy violations! Check ${CHECKOV_OUTPUT} for details."
+                    } else {
+                        echo "✅Checkov passed with no violations."
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            archiveArtifacts artifacts: "${CHECKOV_OUTPUT}", allowEmptyArchive: true
+        }
+    }
+}
