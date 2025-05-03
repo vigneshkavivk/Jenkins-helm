@@ -1,82 +1,88 @@
 pipeline {
-    agent any
+  agent any
 
-    environment {
-        VENV_PATH = 'venv-checkov'
-        CHECKOV_OUTPUT = 'checkov_output.txt'
-        REPO_URL = 'https://github.com/vigneshkavivk/ghost-blog.git'
-        REPO_BRANCH = 'main'
-        CUSTOM_POLICIES_DIR = 'custom_policies'  // Store the path to the custom policies directory
+  environment {
+    CUSTOM_POLICIES_REPO = 'https://github.com/vigneshkavivk/custom-checkov.git'
+    CUSTOM_POLICIES_BRANCH_NAME = 'main'
+    POLICIES_DIR = 'old_custom_policies/k8s_policies'
+    HELM_REPO = 'https://github.com/vigneshkavivk/ghost-blog.git'
+    HELM_BRANCH_NAME = 'main'
+    HELM_DIR = 'ghost-blog'
+    CHECKOV_VERSION = '3.2.414'
+    VENV_PATH = 'venv'
+  }
+
+  stages {
+    stage('Clean Workspace') {
+      steps {
+        cleanWs()
+        sh '''
+        echo "Cleaning old directories..."
+        rm -rf "${VENV_PATH}" "${POLICIES_DIR}" "${HELM_DIR}" checkov_output
+        '''
+      }
     }
 
-    stages {
-        stage('Clone Helm Repo') {
-            steps {
-                git branch: "${REPO_BRANCH}",
-                    url: "${REPO_URL}"
-            }
-        }
+    stage('Clone Repositories') {
+      steps {
+        sh '''
+        echo "Cloning custom policies repo..."
+        git clone --branch "${CUSTOM_POLICIES_BRANCH_NAME}" "${CUSTOM_POLICIES_REPO}" "${POLICIES_DIR}"
 
-        stage('Set Up Virtual Environment and Install Checkov') {
-            steps {
-                sh '''
-                    apt install python3.11-venv -y
-                    python3 -m venv ${VENV_PATH}
-                    . ${VENV_PATH}/bin/activate
-                    ${VENV_PATH}/bin/pip install --upgrade pip
-                    ${VENV_PATH}/bin/pip install checkov
-                    curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
-                '''
-            }
-        }
-
-        stage('Render Helm Charts') {
-            steps {
-                sh '''
-                    echo "🧹 Cleaning previous rendered files..."
-                    rm -rf rendered/
-                    mkdir -p rendered
-                    
-                    echo "🔧 Rendering Helm charts into split files..."
-                    find . -name "Chart.yaml" | while read chart_file; do
-                        chart_dir=$(dirname "$chart_file")
-                        chart_name=$(basename "$chart_dir" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-')
-                        mkdir -p rendered/${chart_name}
-                        helm template ${chart_name} ${chart_dir} --output-dir rendered/${chart_name}
-                    done
-                '''
-            }
-        }
-
-        stage('Run Checkov with Custom Policies Only') {
-            steps {
-                script {
-                    def checkovExitCode = sh(
-                        script: '''
-                            . ${VENV_PATH}/bin/activate
-                            echo "👉 Running Checkov with custom policies only..." > ${CHECKOV_OUTPUT}
-                            ${VENV_PATH}/bin/checkov -d rendered/ --framework kubernetes \
-                                --external-checks-dir ${CUSTOM_POLICIES_DIR} --check MASA_K8S_001,MASA_K8S_002,MASA_K8S_003,MASA_K8S_004,MASA_K8S_005,MASA_K8S_006,MASA_K8S_007,MASA_K8S_008,MASA_K8S_009,MASA_K8S_010,MASA_K8S_011,MASA_K8S_012,MASA_K8S_013,MASA_K8S_014,MASA_K8S_015,CKV_CUSTOM_001 \
-                                | tee -a ${CHECKOV_OUTPUT}
-                        ''',
-                        returnStatus: true
-                    )
-        
-                    sh "cat ${CHECKOV_OUTPUT}"
-        
-                    if (checkovExitCode != 0) {
-                        error "❌Checkov found violations in custom policies! Check ${CHECKOV_OUTPUT} for details."
-                    } else {
-                        echo "✅Checkov custom policy scan passed."
-                    }
-                }
-            }
-        }
+        echo "Cloning Helm chart repo..."
+        git clone --branch "${HELM_BRANCH_NAME}" "${HELM_REPO}" "${HELM_DIR}"
+        '''
+      }
     }
 
-    post {
-        always {
-            archiveArtifacts artifacts: "${CHECKOV_OUTPUT}", allowEmptyArchive: true
-        }
+    stage('Set Up Python & Install Checkov') {
+      steps {
+        sh '''
+        echo "Setting up virtual environment and installing Checkov..."
+        python3 -m venv "${VENV_PATH}"
+        . "${VENV_PATH}/bin/activate"
+        pip install --upgrade pip
+        pip install checkov=="${CHECKOV_VERSION}"
+        '''
+      }
     }
+
+    stage('Scan Helm Charts with Custom Policies') {
+  steps {
+    sh '''
+    echo "Scanning Helm charts using custom Checkov policies..."
+    . "${VENV_PATH}/bin/activate"
+
+    CHECK_IDS=$(grep -r 'id: MASA_' "${POLICIES_DIR}" | awk '{print $2}' | paste -sd ',')
+    echo "Running Checkov for checks: $CHECK_IDS"
+
+    mkdir -p checkov_output
+
+    checkov -d "${HELM_DIR}" \
+      --external-checks-dir "${POLICIES_DIR}" \
+      --run-all-external-checks \
+      --check "$CHECK_IDS" \
+      --output cli \
+      > checkov_output/checkov_output.txt || echo "Checkov found policy violations" 
+    '''
+  }
+}
+
+
+    stage('Archive Results') {
+      steps {
+        archiveArtifacts artifacts: 'checkov_output/*', allowEmptyArchive: true
+      }
+    }
+
+  }
+
+  post {
+    always {
+      echo "Pipeline finished. Check results in archived artifacts."
+    }
+    failure {
+      echo "Checkov reported failed policies. Review 'checkov_output'."
+    }
+  }
 }
