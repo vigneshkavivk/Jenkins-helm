@@ -1,0 +1,92 @@
+pipeline {
+  agent any
+
+  environment {
+    CUSTOM_POLICIES_REPO = 'https://github.com/vigneshkavivk/custom-checkov.git'
+    CUSTOM_POLICIES_BRANCH_NAME = 'main'
+    POLICIES_DIR = 'old_custom_policies/tf_policies'
+    IAC_REPO = 'https://github.com/CloudMasa-Tech/terraformmodules.git' // replace with actual repo
+    IAC_BRANCH_NAME = 'submain2'
+    IAC_DIR = 'terraform-iac'
+    CHECKOV_VERSION = '3.2.414'
+    VENV_PATH = 'venv'
+  }
+
+  stages {
+    stage('Clean Workspace') {
+      steps {
+        cleanWs()
+        sh '''
+        echo "Cleaning old directories..."
+        rm -rf "${VENV_PATH}" "${POLICIES_DIR}" "${IAC_DIR}" checkov_output
+        '''
+      }
+    }
+
+    stage('Clone Repositories') {
+      steps {
+        script {
+          sh '''
+          echo "Cloning custom policies repo..."
+          git clone --branch "${CUSTOM_POLICIES_BRANCH_NAME}" "${CUSTOM_POLICIES_REPO}" "${POLICIES_DIR}"
+          '''
+          
+          withCredentials([usernamePassword(credentialsId: 'github-creds', usernameVariable: 'GIT_USERNAME', passwordVariable: 'GIT_TOKEN')]) {
+            sh '''
+            echo "Cloning IaC repo..."
+            git clone --branch "${IAC_BRANCH_NAME}" https://${GIT_USERNAME}:${GIT_TOKEN}@github.com/CloudMasa-Tech/terraformmodules.git "${IAC_DIR}"
+            '''
+          }
+        }
+      }
+    }
+
+    stage('Set Up Python & Install Checkov') {
+      steps {
+        sh '''
+        echo "Setting up virtual environment and installing Checkov..."
+        python3 -m venv "${VENV_PATH}"
+        . "${VENV_PATH}/bin/activate"
+        pip install --upgrade pip
+        pip install checkov=="${CHECKOV_VERSION}"
+        '''
+      }
+    }
+
+    stage('Scan IaC Code with Custom Policies') {
+      steps {
+        sh '''
+        echo "Scanning IaC code using custom Checkov policies..."
+        . "${VENV_PATH}/bin/activate"
+
+        CHECK_IDS=$(grep -r 'id: MASA_' "${POLICIES_DIR}" | awk '{print $2}' | paste -sd ',')
+        echo "Running Checkov for checks: $CHECK_IDS"
+
+        mkdir -p checkov_output
+
+        checkov -d "${IAC_DIR}" \
+          --external-checks-dir "${POLICIES_DIR}" \
+          --run-all-external-checks \
+          --check "$CHECK_IDS" \
+          --output cli \
+          > checkov_output/checkov_output.txt || echo "Checkov found policy violations"
+        '''
+      }
+    }
+
+    stage('Archive Results') {
+      steps {
+        archiveArtifacts artifacts: 'checkov_output/*', allowEmptyArchive: true
+      }
+    }
+  }
+
+  post {
+    always {
+      echo "Pipeline finished. Check results in archived artifacts."
+    }
+    failure {
+      echo "Checkov reported failed policies. Review 'checkov_output'."
+    }
+  }
+}
