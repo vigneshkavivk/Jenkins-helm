@@ -1,0 +1,173 @@
+pipeline {
+    agent any
+
+    environment {
+        DEPLOY_DIR = '/var/www/react-app'
+        SSH_SERVER = '18.204.203.92'
+        SSH_USER = 'ubuntu'
+        CI = 'false'  // Suppress React warnings during build, optional
+    }
+
+    tools {
+        nodejs 'Node18'  // NodeJS installation named 'Node18' in Jenkins global tools
+    }
+
+    stages {
+        stage('Clean Workspace') {
+            steps {
+                cleanWs()
+            }
+        }
+
+        stage('Checkout Code') {
+            steps {
+                script {
+                    // Disable git-lfs smudge for faster checkout if LFS files are not needed
+                    sh 'git config --global filter.lfs.smudge "git-lfs smudge --skip"'
+                    sh 'git config --global filter.lfs.required false'
+
+                    checkout([
+                        $class: 'GitSCM',
+                        branches: [[name: 'active']],
+                        extensions: [[
+                            $class: 'CloneOption',
+                            depth: 1,
+                            shallow: true
+                        ]],
+                        userRemoteConfigs: [[
+                            credentialsId: 'sandy-token',
+                            url: 'https://github.com/CloudMasa-Tech/app-cloudmasa.git'
+                        ]]
+                    ])
+
+                    // Verify client directory and package.json presence
+                    sh '''
+                        echo "Verifying project structure..."
+                        [ -d client ] || { echo "❌ Missing client directory"; exit 1; }
+                        [ -f client/package.json ] || { echo "❌ Missing client/package.json"; exit 1; }
+                        [ -d server ] && echo "✅ Server directory found" || echo "ℹ️ No server directory - skipping backend."
+                    '''
+                }
+            }
+        }
+
+        stage('Install Dependencies') {
+            parallel {
+                stage('Client') {
+                    steps {
+                        dir('client') {
+                            sh '''
+                                echo "📦 Installing client dependencies..."
+                                npm ci --legacy-peer-deps
+                                npm install @babel/plugin-transform-private-property-in-object --save-dev
+                                npm audit fix || true
+                            '''
+                        }
+                    }
+                }
+
+                stage('Server') {
+                    steps {
+                        dir('server') {
+                            sh '''
+                                if [ -f package.json ]; then
+                                    echo "📦 Installing server dependencies..."
+                                    npm ci --legacy-peer-deps --omit=dev
+                                    npm audit fix || true
+                                else
+                                    echo "ℹ️ No package.json in server/ - skipping."
+                                fi
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Build Client') {
+            steps {
+                dir('client') {
+                    sh '''
+                        echo "⚙️ Building client application..."
+                        NODE_OPTIONS="--max-old-space-size=4096" npm run build
+
+                        [ -d dist ] || { echo "❌ Build failed - no dist directory"; exit 1; }
+                        [ -f dist/index.html ] || { echo "❌ dist/index.html missing"; exit 1; }
+                        ls dist/assets/index-*.js >/dev/null 2>&1 || { echo "❌ Main JS bundle missing"; exit 1; }
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy') {
+            steps {
+                script {
+                    withCredentials([sshUserPrivateKey(
+                        credentialsId: 'web-hook',
+                        keyFileVariable: 'SSH_KEY_FILE',
+                        usernameVariable: 'SSH_USERNAME'
+                    )]) {
+                        sh """
+                            echo "🚀 Deploying to ${SSH_SERVER}..."
+
+                            # Prepare remote deploy directory
+                            ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no "${SSH_USER}@${SSH_SERVER}" \
+                                "mkdir -p '${DEPLOY_DIR}'"
+
+                            # Sync client build to remote server
+                            rsync -avz --delete --progress \
+                                -e "ssh -i $SSH_KEY_FILE -o StrictHostKeyChecking=no" \
+                                client/dist/ "${SSH_USER}@${SSH_SERVER}:${DEPLOY_DIR}/"
+
+                            # Verify deployment
+                            DEPLOYED_FILES=\$(ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no "${SSH_USER}@${SSH_SERVER}" \
+                                "find '${DEPLOY_DIR}' -type f | wc -l")
+                            echo "📁 Files deployed: \$DEPLOYED_FILES"
+
+                            if [ "\$DEPLOYED_FILES" -lt 5 ]; then
+                                echo "❌ Deployment failed - too few files"
+                                exit 1
+                            fi
+
+                            # Start or restart PM2 serving the React app
+                            ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no "${SSH_USER}@${SSH_SERVER}" bash -c "'
+                                set -e
+                                echo \"🌐 Starting PM2 process...\"
+                                if ! command -v pm2 >/dev/null; then
+                                    echo \"Installing PM2...\"
+                                    npm install -g pm2
+                                fi
+
+                                pm2 delete react-app || true
+                                pm2 serve ${DEPLOY_DIR} 3000 --spa --name react-app
+                                pm2 save
+                                pm2 startup systemd -u ${SSH_USER} --hp /home/${SSH_USER} || true
+                                pm2 list
+
+                                if command -v nginx >/dev/null && command -v systemctl >/dev/null; then
+                                    echo \"🔄 Reloading Nginx...\"
+                                    sudo systemctl reload nginx
+                                else
+                                    echo \"ℹ️ Nginx or systemctl not found - skipping reload\"
+                                fi
+                            '"
+                        """
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            echo "🧹 Cleaning workspace"
+            cleanWs()
+        }
+        success {
+            echo "✅ Deployment successful"
+        }
+        failure {
+            echo "❌ Deployment failed"
+        }
+    }
+}

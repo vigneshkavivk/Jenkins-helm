@@ -1,0 +1,52 @@
+pipeline {
+    agent any
+
+    environment {
+        AWS_ACCESS_KEY_ID     = credentials('aws-access-key')
+        AWS_SECRET_ACCESS_KEY = credentials('aws-secret-key')
+        AWS_REGION            = 'us-east-1'
+        INSTANCE_ID           = 'i-0e59de56634a0ff86'
+    }
+
+    stages {
+        stage('Install AWS CLI') {
+            steps {
+                script {
+                    if (sh(script: 'command -v aws', returnStatus: true) != 0) {
+                        echo "Installing AWS CLI..."
+                        sh '''
+                            curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+                            rm -rf aws
+                            unzip -q awscliv2.zip
+                            ./aws/install
+                            rm -rf awscliv2.zip aws/
+                        '''
+                    } else {
+                        echo "AWS CLI already installed."
+                    }
+                    sh 'aws --version'
+                }
+            }
+        }
+
+        stage('Stop EC2 Instance') {
+            steps {
+                sh '''
+                    echo "Stopping EC2 instance $INSTANCE_ID..."
+                    aws ec2 stop-instances --instance-ids $INSTANCE_ID --region $AWS_REGION
+                    echo "EC2 instance $INSTANCE_ID stopped."
+                '''
+            }
+        }
+    }
+
+    post {
+        always {
+            cleanWs()
+            echo "Pipeline complete."
+        }
+        failure {
+            echo "Pipeline failed. Check logs for errors."
+        }
+    }
+}

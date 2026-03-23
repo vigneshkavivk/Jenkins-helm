@@ -1,0 +1,141 @@
+pipeline {
+    agent any
+
+    parameters {
+        choice(name: 'MODE', choices: ['create', 'delete'], description: 'Choose to create or delete the S3 bucket and DynamoDB table')
+        string(name: 'BUCKET_NAME', defaultValue: 'my-tf-state-file-1', description: 'Name of the S3 bucket')
+        string(name: 'TABLE_NAME', defaultValue: 'terraform-lock-table', description: 'Name of the DynamoDB table')
+        string(name: 'AWS_REGION', defaultValue: 'us-east-1', description: 'AWS Region')
+    }
+
+    environment {
+        AWS_REGION = "${params.AWS_REGION}"
+        LOCAL_BIN = "/usr/local/bin"
+    }
+
+    stages {
+        stage('Install AWS CLI') {
+            steps {
+                script {
+                    if (sh(script: 'command -v aws', returnStatus: true) != 0) {
+                        echo "Installing AWS CLI..."
+                        sh '''
+                            curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+                            rm -rf aws
+                            unzip -q awscliv2.zip
+                            ./aws/install
+                            rm -rf awscliv2.zip aws/
+                        '''
+                    }
+                    sh 'aws --version'
+                }
+            }
+        }
+
+        stage('Install Terraform') {
+            steps {
+                script {
+                    if (sh(script: 'command -v terraform', returnStatus: true) != 0) {
+                        echo "Installing Terraform 1.5.0..."
+                        sh '''
+                            curl -fsSL https://releases.hashicorp.com/terraform/1.5.0/terraform_1.5.0_linux_amd64.zip -o terraform.zip
+                            unzip -o terraform.zip
+                            mv terraform /usr/local/bin/
+                            rm -f terraform.zip
+                        '''
+                    }
+                    sh 'terraform -version'
+                }
+            }
+        }
+
+        stage('Install kubectl') {
+            steps {
+                script {
+                    if (sh(script: 'command -v kubectl', returnStatus: true) != 0) {
+                        echo 'Installing kubectl...'
+                        sh '''
+                            curl -LO https://dl.k8s.io/release/v1.26.1/bin/linux/amd64/kubectl
+                            chmod +x kubectl
+                            mv kubectl /usr/local/bin/kubectl
+                        '''
+                    }
+                    sh 'kubectl version --client'
+                }
+            }
+        }
+
+        stage('Manage S3 and DynamoDB') {
+            steps {
+                withCredentials([aws(credentialsId: 'aws-creds', accessKeyVariable: 'AWS_ACCESS_KEY_ID', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+                    script {
+                        def bucket = params.BUCKET_NAME
+                        def table = params.TABLE_NAME
+                        def region = params.AWS_REGION
+                        def mode = params.MODE
+
+                        if (mode == 'create') {
+                            echo "🔧 Creating S3 bucket '${bucket}' and DynamoDB table '${table}' in region '${region}'..."
+
+                            sh """
+                                if aws s3api head-bucket --bucket ${bucket} 2>/dev/null; then
+                                    echo "❌ Bucket ${bucket} already exists. Failing the build."
+                                    exit 1
+                                else
+                                    echo "Creating S3 bucket: ${bucket}"
+                                    aws s3api create-bucket \\
+                                        --bucket ${bucket} \\
+                                        --region ${region} \\
+                                        ${region == 'us-east-1' ? '' : "--create-bucket-configuration LocationConstraint=${region}"}
+
+                                    echo "Enabling versioning on bucket: ${bucket}"
+                                    aws s3api put-bucket-versioning \\
+                                        --bucket ${bucket} \\
+                                        --versioning-configuration Status=Enabled
+                                fi
+                            """
+
+                            sh """
+                                if ! aws dynamodb describe-table --table-name ${table} --region ${region} 2>/dev/null; then
+                                    echo "Creating DynamoDB table: ${table}"
+                                    aws dynamodb create-table \\
+                                        --table-name ${table} \\
+                                        --attribute-definitions AttributeName=Id,AttributeType=S \\
+                                        --key-schema AttributeName=Id,KeyType=HASH \\
+                                        --provisioned-throughput ReadCapacityUnits=5,WriteCapacityUnits=5 \\
+                                        --region ${region}
+                                else
+                                    echo "DynamoDB table ${table} already exists. Skipping creation."
+                                fi
+                            """
+                        } else if (mode == 'delete') {
+                            echo "🗑️ Deleting S3 bucket '${bucket}' and DynamoDB table '${table}'..."
+
+                            sh """
+                                aws s3 rm s3://${bucket} --recursive || true
+                                aws s3api delete-bucket --bucket ${bucket} --region ${region} || true
+                                echo "S3 bucket ${bucket} deleted."
+                            """
+
+                            sh """
+                                aws dynamodb delete-table --table-name ${table} --region ${region} || true
+                                echo "DynamoDB table ${table} deleted."
+                            """
+                        } else {
+                            error("Invalid MODE: ${mode}. Must be 'create' or 'delete'.")
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "✅ ${params.MODE.capitalize()} process completed successfully."
+        }
+        failure {
+            echo "❌ Failed to ${params.MODE} resources."
+        }
+    }
+}

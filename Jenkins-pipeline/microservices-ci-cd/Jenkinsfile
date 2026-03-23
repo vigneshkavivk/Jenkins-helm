@@ -1,0 +1,83 @@
+@Library('microservices-ci-cd@main') _
+
+pipeline {
+    agent any
+    environment {
+        // Correct paths based on actual workspace structure
+        WORKSPACE_ROOT = "${env.WORKSPACE}"
+        SERVICE_NAME = 'service-a'
+        SERVICE_PATH = "${WORKSPACE_ROOT}/services/${SERVICE_NAME}"
+        REGISTRY = 'my-docker-registry.com'
+        CHART_PATH = "${SERVICE_PATH}/helm"
+        RELEASE_NAME = "${SERVICE_NAME}-release"
+        NAMESPACE = 'default'
+        IMAGE_NAME = "${REGISTRY}/${SERVICE_NAME}"
+        IMAGE_TAG = 'latest'
+    }
+
+    stages {
+        stage('Verify Structure') {
+            steps {
+                script {
+                    echo "Workspace: ${WORKSPACE_ROOT}"
+                    sh """
+                        echo "Current directory contents:"
+                        pwd && ls -la
+                        echo "\nServices directory:"
+                        ls -la ${WORKSPACE_ROOT}/services || echo "Services directory not found"
+                        echo "\nService directory:"
+                        ls -la ${SERVICE_PATH} || echo "Service directory not found"
+                    """
+                }
+            }
+        }
+
+        stage('Build') {
+            steps {
+                script {
+                    buildApp(SERVICE_PATH)
+                }
+            }
+        }
+
+        stage('Test') {
+            steps {
+                script {
+                    testApp(SERVICE_PATH)
+                }
+            }
+        }
+
+        stage('Dockerize') {
+            steps {
+                script {
+                    dockerizeApp(SERVICE_PATH, REGISTRY)
+                }
+            }
+        }
+
+        stage('Deploy') {
+            steps {
+                script {
+                    deployAppWithHelm(
+                        chartPath: CHART_PATH,
+                        releaseName: RELEASE_NAME,
+                        namespace: NAMESPACE,
+                        imageRepo: IMAGE_NAME,
+                        imageTag: IMAGE_TAG
+                    )
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            echo "Pipeline execution completed"
+        }
+        failure {
+            echo "Pipeline failed - please check logs"
+            // Add notification here if needed
+        }
+    }
+}

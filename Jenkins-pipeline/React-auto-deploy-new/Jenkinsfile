@@ -1,0 +1,148 @@
+pipeline {
+    agent any
+
+    environment {
+        DEPLOY_DIR = '/home/ubuntu/app-cloudmasa'
+        SSH_SERVER = '54.81.184.70'
+        SSH_USER = 'ubuntu'
+        CI = 'false' // Suppress React CI warnings
+    }
+
+    tools {
+        nodejs 'Node18'
+    }
+
+    stages {
+        stage('Clean Workspace') {
+            steps {
+                cleanWs()
+            }
+        }
+
+        stage('Checkout Code') {
+            steps {
+                script {
+                    sh '''
+                        git config --global filter.lfs.smudge "git-lfs smudge --skip"
+                        git config --global filter.lfs.required false
+                    '''
+
+                    checkout([
+                        $class: 'GitSCM',
+                        branches: [[name: 'live']],
+                        extensions: [[
+                            $class: 'CloneOption',
+                            depth: 1,
+                            shallow: true
+                        ]],
+                        userRemoteConfigs: [[
+                            credentialsId: 'sandy-token',
+                            url: 'https://github.com/CloudMasa-Tech/app-cloudmasa.git'
+                        ]]
+                    ])
+                }
+            }
+        }
+
+        stage('Install Dependencies') {
+            parallel {
+                stage('Client') {
+                    steps {
+                        dir('client') {
+                            sh '''
+                                set -e
+                                echo "📦 Installing client dependencies..."
+                                npm ci --legacy-peer-deps
+                                npm install @babel/plugin-transform-private-property-in-object --save-dev
+                                npm audit fix || true
+                            '''
+                        }
+                    }
+                }
+                stage('Server') {
+                    steps {
+                        dir('server') {
+                            sh '''
+                                set -e
+                                if [ -f package.json ]; then
+                                    echo "📦 Installing server dependencies..."
+                                    npm ci --legacy-peer-deps --omit=dev
+                                    npm audit fix || true
+                                else
+                                    echo "ℹ️ No package.json in server/ - skipping."
+                                fi
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Build Client') {
+            steps {
+                dir('client') {
+                    sh '''
+                        set -e
+                        echo "⚙️ Building client application..."
+                        NODE_OPTIONS="--max-old-space-size=4096" npm run build
+
+                        echo "✅ Validating build artifacts..."
+                        [ -d dist ] || { echo "❌ Build failed - no dist directory"; exit 1; }
+                        [ -f dist/index.html ] || { echo "❌ dist/index.html missing"; exit 1; }
+                        ls dist/assets/index-*.js >/dev/null 2>&1 || { echo "❌ Main JS bundle missing"; exit 1; }
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy') {
+            steps {
+                script {
+                    withCredentials([sshUserPrivateKey(
+                        credentialsId: 'web-hook-new',
+                        keyFileVariable: 'SSH_KEY_FILE',
+                        usernameVariable: 'SSH_USERNAME'
+                    )]) {
+                        sh """
+                            ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no ${SSH_USER}@${SSH_SERVER} '
+                                sudo rm -rf ${DEPLOY_DIR}/client/*
+                                sudo rm -rf ${DEPLOY_DIR}/server/*
+                                sudo mkdir -p ${DEPLOY_DIR}/client ${DEPLOY_DIR}/server
+                                sudo chown -R ${SSH_USER}:${SSH_USER} ${DEPLOY_DIR}
+                            '
+
+                            rsync -az -e "ssh -i $SSH_KEY_FILE -o StrictHostKeyChecking=no" client/ ${SSH_USER}@${SSH_SERVER}:${DEPLOY_DIR}/client/
+                            rsync -az -e "ssh -i $SSH_KEY_FILE -o StrictHostKeyChecking=no" server/ ${SSH_USER}@${SSH_SERVER}:${DEPLOY_DIR}/server/
+
+                            ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no ${SSH_USER}@${SSH_SERVER} '
+                                sudo systemctl reload apache2 || sudo systemctl reload httpd || true
+
+                                if [ -f ${DEPLOY_DIR}/server/index.js ]; then
+                                    cd ${DEPLOY_DIR}/server
+                                    if ! command -v pm2 >/dev/null; then
+                                        sudo npm install -g pm2
+                                    fi
+                                    pm2 start index.js --name cloudmasa-api || pm2 restart cloudmasa-api
+                                    pm2 save
+                                fi
+                            '
+                        """
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            echo "🧹 Cleaning workspace"
+            cleanWs()
+        }
+        success {
+            echo "✅ Deployment successful"
+        }
+        failure {
+            echo "❌ Deployment failed"
+        }
+    }
+}

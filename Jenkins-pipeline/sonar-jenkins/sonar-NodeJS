@@ -1,0 +1,54 @@
+ tools {
+    nodejs 'Node18' // Ensure this is configured in Jenkins global tools
+  }
+
+  environment {
+    SONAR_SCANNER_HOME = tool 'sonar-scanner' // Matches Jenkins global tool configuration
+    SONAR_HOST_URL = 'http://af42bc0007ede4ab6949ad087ae76e42-dc28f9bee8a4749e.elb.us-east-1.amazonaws.com:9000'
+    SONAR_PROJECT_KEY = 'sonar-project-1'
+  }
+
+  stages {
+    stage('Checkout') {
+      steps {
+        git credentialsId: 'github-private-repo',
+            url: 'https://github.com/CloudMasa-Tech/app-cloudmasa.git',
+            branch: 'test'
+      }
+    }
+
+    stage('Install Dependencies') {	
+      steps {
+        sh 'npm install'
+      }
+    }
+
+    stage('Run Tests') {
+      steps {
+        sh 'npm test || true' // Skip test failures, optional
+      }
+    }
+
+    stage('SonarQube Scan') {
+      environment {
+        SONAR_SCANNER_OPTS = '-Xmx2G' // 👈 Increase heap size for large projects
+      }
+      steps {
+        withCredentials([string(credentialsId: 'analyze-sp1', variable: 'SONAR_TOKEN')]) {
+          withSonarQubeEnv('sonar-server') {
+            sh '''
+              set -e
+              ${SONAR_SCANNER_HOME}/bin/sonar-scanner \
+                -Dsonar.projectKey=$SONAR_PROJECT_KEY \
+                -Dsonar.projectName="sonar-project-1" \
+                -Dsonar.sources=. \
+                -Dsonar.host.url=$SONAR_HOST_URL \
+                -Dsonar.login=$SONAR_TOKEN
+            '''
+          }
+        }
+      }
+    }
+  }
+}
+	

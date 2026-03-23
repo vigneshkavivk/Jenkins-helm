@@ -1,0 +1,116 @@
+pipeline {
+    agent any
+
+    environment {
+        CHART_PATH = 'Nexus'  // Source chart folder
+        SONAR_PROJECT_KEY = 'tools-check'
+        SONAR_PROJECT_NAME = 'tools-check'
+        SONAR_HOST_URL = 'http://af42bc0007ede4ab6949ad087ae76e42-dc28f9bee8a4749e.elb.us-east-1.amazonaws.com:9000'
+        SONAR_SCANNER_HOME = tool 'sonar-scanner'
+        SONAR_SCANNER_OPTS = '-Xmx2G'
+
+        VENV_PATH = 'venv'
+        CHECKOV_OUTPUT = 'output/checkov-report.json'
+        SONAR_ISSUES_JSON = 'output/sonar-checkov-report.json'
+    }
+
+    stages {
+
+        stage('Clone Helm Repo') {
+            steps {
+                git credentialsId: 'github-private-repo',
+                    url: 'https://github.com/CloudMasa-Tech/tools.git',
+                    branch: 'master'
+            }
+        }
+
+        stage('Set Up Virtual Environment and Install Tools') {
+            steps {
+                sh '''
+                    echo "🐍 Setting up Python virtual environment..."
+                    apt-get update && apt-get install -y python3.11-venv curl
+                    python3 -m venv ${VENV_PATH}
+                    . ${VENV_PATH}/bin/activate
+
+                    echo "⬆️ Upgrading pip..."
+                    ${VENV_PATH}/bin/pip install --upgrade pip
+
+                    echo "📦 Installing Checkov and converter..."
+                    ${VENV_PATH}/bin/pip install checkov checkov-to-sonarqube || true
+
+                    echo "📥 Installing Helm..."
+                    curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+                '''
+            }
+        }
+
+        stage('Render Helm Charts') {
+            steps {
+                sh '''
+                    echo "🧹 Cleaning previous rendered files..."
+                    rm -rf rendered/
+                    mkdir -p rendered/nexus
+
+                    echo "🔧 Rendering Helm chart from Nexus..."
+                    helm template nexus ${CHART_PATH} --output-dir rendered/nexus
+                '''
+            }
+        }
+
+        stage('Run Checkov on Rendered YAMLs') {
+            steps {
+                sh '''
+                    echo "🔍 Running Checkov scan..."
+                    mkdir -p output
+                    . ${VENV_PATH}/bin/activate
+                    ${VENV_PATH}/bin/checkov -d rendered --framework kubernetes --quiet \
+                        --output json > ${CHECKOV_OUTPUT} || true
+                '''
+            }
+        }
+
+        stage('Convert Checkov Report to SonarQube Format') {
+    steps {
+        sh '''
+            echo "🔁 Converting Checkov report for SonarQube..."
+            . ${VENV_PATH}/bin/activate
+            if ${VENV_PATH}/bin/checkov-to-sonarqube --help > /dev/null 2>&1; then
+                ${VENV_PATH}/bin/checkov-to-sonarqube \
+                    --input ${CHECKOV_OUTPUT} \
+                    --output temp-${SONAR_ISSUES_JSON}
+                jq '{ "issues": . }' temp-${SONAR_ISSUES_JSON} > ${SONAR_ISSUES_JSON}
+            else
+                echo "⚠️ checkov-to-sonarqube not available, creating empty report..."
+                echo '{ "issues": [] }' > ${SONAR_ISSUES_JSON}
+            fi
+        '''
+    }
+}
+
+
+        stage('SonarQube Scan') {
+            steps {
+                withCredentials([string(credentialsId: 'analyze-sp1', variable: 'SONAR_TOKEN')]) {
+                    withSonarQubeEnv('sonar-server') {
+                        sh '''
+                            echo "🚀 Running SonarQube scanner..."
+                            ${SONAR_SCANNER_HOME}/bin/sonar-scanner \
+                                -Dsonar.projectKey=${SONAR_PROJECT_KEY} \
+                                -Dsonar.projectName="${SONAR_PROJECT_NAME}" \
+                                -Dsonar.sources=rendered/nexus \
+                                -Dsonar.externalIssuesReportPaths=${SONAR_ISSUES_JSON} \
+                                -Dsonar.verbose=true \
+                                -Dsonar.login=$SONAR_TOKEN
+                        '''
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            archiveArtifacts artifacts: 'output/**', allowEmptyArchive: true
+        }
+    }
+}
